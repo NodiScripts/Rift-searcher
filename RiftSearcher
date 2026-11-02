@@ -1,6 +1,6 @@
 -- BGSI Rift Radar
 -- One themed Discord embed per loaded rift.
--- Reports first, then attempts a public-server hop.
+-- After all reports succeed, immediately begin server hopping.
 --
 -- Requires:
 --   request/http_request
@@ -16,9 +16,12 @@ local CONFIG = {
     -- Optional direct, publicly accessible HTTPS GIF URL.
     GifUrl = "",
 
+    -- Wait after loading so rift labels can populate.
     SettleSeconds = 10,
+
+    -- Applied BETWEEN messages, never after the final message.
     MessageDelay = 2,
-    HopDelay = 15,
+
     MaxServerPages = 5
 }
 
@@ -77,14 +80,17 @@ end
 
 environment.BGSI_RIFT_RADAR_RUNNING = true
 
+-- Preserved across successful queued executions.
 local visited = type(VISITED) == "table" and VISITED or {}
 visited[game.JobId] = true
 
 local function requestSafely(options)
     local ok, response = pcall(http, options)
+
     if ok and type(response) == "table" then
         return response
     end
+
     return nil
 end
 
@@ -96,6 +102,7 @@ local function decode(body)
     if ok and type(value) == "table" then
         return value
     end
+
     return nil
 end
 
@@ -105,7 +112,9 @@ local function clean(value, limit)
         :gsub("`", "'")
 
     local ok, boundary = pcall(
-        utf8.offset, text, (limit or 100) + 1
+        utf8.offset,
+        text,
+        (limit or 100) + 1
     )
 
     if ok and boundary then
@@ -124,11 +133,15 @@ local function sendDiscord(message)
     if type(message) == "table" then
         payload = message
     else
-        payload = {content = tostring(message)}
+        payload = {
+            content = tostring(message)
+        }
     end
 
     payload.username = "🍬 BGSI • Rift Radar"
-    payload.allowed_mentions = {parse = {}}
+    payload.allowed_mentions = {
+        parse = {}
+    }
 
     for attempt = 1, 3 do
         local response = requestSafely({
@@ -157,6 +170,7 @@ local function sendDiscord(message)
 
         local data = decode(response.Body)
         local delay = data and tonumber(data.retry_after) or 5
+
         task.wait(math.max(delay or 5, 1) + 1)
     end
 
@@ -167,7 +181,9 @@ local function readLabels(rift)
     local labels = {}
 
     for _, object in ipairs(rift:GetDescendants()) do
-        if object:IsA("TextLabel") or object:IsA("TextButton") then
+        if object:IsA("TextLabel")
+            or object:IsA("TextButton") then
+
             local text = clean(object.Text, 120)
 
             if text:match("%S") then
@@ -249,6 +265,7 @@ local function buildEmbed(rift, labels, joinUrl)
     local embed = {
         title = "🫧 " .. displayName .. " • Rift Spotted!",
         url = joinUrl,
+
         description =
             "🍬 **Bubble Gum Simulator Infinity**\n"
             .. "A loaded egg / rift entry was detected.\n\n"
@@ -295,6 +312,7 @@ local function buildEmbed(rift, labels, joinUrl)
             seen[label.text] = true
 
             local line = "▫️ " .. label.text
+
             if bytes + #line + 1 > 850 then
                 table.insert(details, "…additional labels omitted")
                 break
@@ -314,7 +332,9 @@ local function buildEmbed(rift, labels, joinUrl)
     end
 
     if CONFIG.GifUrl:match("^https://") then
-        embed.image = {url = CONFIG.GifUrl}
+        embed.image = {
+            url = CONFIG.GifUrl
+        }
     end
 
     return embed
@@ -340,11 +360,14 @@ local function findNextServer()
             Method = "GET"
         })
 
-        if not response or tonumber(response.StatusCode) ~= 200 then
+        if not response
+            or tonumber(response.StatusCode) ~= 200 then
+
             return nil, "Public-server listing failed"
         end
 
         local data = decode(response.Body)
+
         if not data or type(data.data) ~= "table" then
             return nil, "Invalid public-server response"
         end
@@ -363,6 +386,7 @@ local function findNextServer()
         end
 
         cursor = data.nextPageCursor
+
         if #candidates > 0 or not cursor then
             break
         end
@@ -381,12 +405,14 @@ local function main()
     log("Waiting for Workspace.Rendered.Rifts...")
 
     local rendered = workspace:WaitForChild("Rendered", 30)
+
     if not rendered then
         fail("Workspace.Rendered did not load.")
         return
     end
 
     local rifts = rendered:WaitForChild("Rifts", 30)
+
     if not rifts then
         fail("Workspace.Rendered.Rifts did not load.")
         return
@@ -426,7 +452,9 @@ local function main()
                     .. "🎮 [Join this server](" .. joinUrl .. ")",
                 color = 16738740,
                 timestamp = os.date("!%Y-%m-%dT%H:%M:%SZ"),
-                footer = {text = "🍭 BGSI Rift Radar"}
+                footer = {
+                    text = "🍭 BGSI Rift Radar"
+                }
             }}
         })
 
@@ -436,38 +464,49 @@ local function main()
         end
     end
 
+    local sentAny = false
+
     for index, rift in ipairs(riftList) do
-        -- Skip entries that disappear before being read.
+        -- Skip entries that disappear before reporting.
         if rift.Parent == rifts then
-            local labels = readLabels(rift)
-            local embed = buildEmbed(rift, labels, joinUrl)
-
-            local sent, reason = sendDiscord({
-                embeds = {embed}
-            })
-
-            if not sent then
-                fail(
-                    "Report failed for " .. rift.Name
-                    .. ": " .. tostring(reason)
-                    .. ". Not hopping."
-                )
-                return
+            -- Wait only before another report, never after the last.
+            if sentAny then
+                task.wait(CONFIG.MessageDelay)
             end
 
-            log(
-                "Sent " .. index .. "/" .. #riftList
-                .. ": " .. rift.Name
-            )
+            -- Recheck after the inter-message delay.
+            if rift.Parent == rifts then
+                local labels = readLabels(rift)
+                local embed = buildEmbed(rift, labels, joinUrl)
 
-            task.wait(CONFIG.MessageDelay)
+                local sent, reason = sendDiscord({
+                    embeds = {embed}
+                })
+
+                if not sent then
+                    fail(
+                        "Report failed for " .. rift.Name
+                        .. ": " .. tostring(reason)
+                        .. ". Not hopping."
+                    )
+                    return
+                end
+
+                sentAny = true
+
+                log(
+                    "Sent " .. index .. "/" .. #riftList
+                    .. ": " .. rift.Name
+                )
+            end
         end
     end
 
-    log("Reports delivered. Waiting before server hop.")
-    task.wait(CONFIG.HopDelay)
+    -- No intentional delay after the final report.
+    log("Reports delivered. Finding the next server now.")
 
     local nextServer, reason = findNextServer()
+
     if not nextServer then
         fail(reason)
         return
@@ -489,6 +528,7 @@ local function main()
     end
 
     local failureConnection
+
     failureConnection = Teleport.TeleportInitFailed:Connect(
         function(who, result)
             if who == player then
@@ -515,6 +555,7 @@ local function main()
 end
 
 local ok, err = pcall(main)
+
 if not ok then
     fail("Runtime error: " .. tostring(err))
 end
@@ -536,12 +577,14 @@ if not run then
 end
 
 local ok, err = pcall(run)
+
 if not ok then
     local environment = _G
+
     if type(getgenv) == "function" then
         environment = getgenv()
     end
-    environment.BGSI_RIFT_RADAR_RUNNING = nil
 
+    environment.BGSI_RIFT_RADAR_RUNNING = nil
     warn("[BGSI Rift Radar] Startup error: " .. tostring(err))
 end
