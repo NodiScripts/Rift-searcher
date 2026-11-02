@@ -1,0 +1,547 @@
+-- BGSI Rift Radar
+-- One themed Discord embed per loaded rift.
+-- Reports first, then attempts a public-server hop.
+--
+-- Requires:
+--   request/http_request
+--   loadstring
+--   queue_on_teleport
+--
+-- Contains your webhook token. Do not share publicly.
+
+local SOURCE = [==[
+local CONFIG = {
+    Webhook = "https://discord.com/api/webhooks/1566866389774377084/UNfq2857ucOwIIUqo9xydNoMr4pyPHXsHPDcdYxwWtmnQCFAUo780Lt7hUdpaYLit9Qs",
+
+    -- Optional direct, publicly accessible HTTPS GIF URL.
+    GifUrl = "",
+
+    SettleSeconds = 10,
+    MessageDelay = 2,
+    HopDelay = 15,
+    MaxServerPages = 5
+}
+
+local Http = game:GetService("HttpService")
+local Players = game:GetService("Players")
+local Teleport = game:GetService("TeleportService")
+
+if not game:IsLoaded() then
+    game.Loaded:Wait()
+end
+
+local player = Players.LocalPlayer
+while not player do
+    task.wait(1)
+    player = Players.LocalPlayer
+end
+
+local environment = _G
+if type(getgenv) == "function" then
+    environment = getgenv()
+end
+
+local function log(message)
+    print("[BGSI Rift Radar] " .. tostring(message))
+end
+
+local function fail(message)
+    environment.BGSI_RIFT_RADAR_RUNNING = nil
+    warn("[BGSI Rift Radar] " .. tostring(message))
+end
+
+local http = request or http_request
+if type(http) ~= "function" and syn then
+    http = syn.request
+end
+
+local queueTeleport = queue_on_teleport or queueonteleport
+if type(queueTeleport) ~= "function" and syn then
+    queueTeleport = syn.queue_on_teleport
+end
+
+if type(http) ~= "function" then
+    warn("[BGSI Rift Radar] No supported HTTP request function.")
+    return
+end
+
+if type(queueTeleport) ~= "function" then
+    warn("[BGSI Rift Radar] queue_on_teleport unavailable.")
+    return
+end
+
+if environment.BGSI_RIFT_RADAR_RUNNING then
+    warn("[BGSI Rift Radar] Already running in this client.")
+    return
+end
+
+environment.BGSI_RIFT_RADAR_RUNNING = true
+
+local visited = type(VISITED) == "table" and VISITED or {}
+visited[game.JobId] = true
+
+local function requestSafely(options)
+    local ok, response = pcall(http, options)
+    if ok and type(response) == "table" then
+        return response
+    end
+    return nil
+end
+
+local function decode(body)
+    local ok, value = pcall(function()
+        return Http:JSONDecode(body or "")
+    end)
+
+    if ok and type(value) == "table" then
+        return value
+    end
+    return nil
+end
+
+local function clean(value, limit)
+    local text = tostring(value)
+        :gsub("[%c]", " ")
+        :gsub("`", "'")
+
+    local ok, boundary = pcall(
+        utf8.offset, text, (limit or 100) + 1
+    )
+
+    if ok and boundary then
+        text = text:sub(1, boundary - 1)
+    elseif not ok then
+        text = text:gsub("[^\032-\126]", "?")
+            :sub(1, limit or 100)
+    end
+
+    return text
+end
+
+local function sendDiscord(message)
+    local payload
+
+    if type(message) == "table" then
+        payload = message
+    else
+        payload = {content = tostring(message)}
+    end
+
+    payload.username = "🍬 BGSI • Rift Radar"
+    payload.allowed_mentions = {parse = {}}
+
+    for attempt = 1, 3 do
+        local response = requestSafely({
+            Url = CONFIG.Webhook,
+            Method = "POST",
+            Headers = {
+                ["Content-Type"] = "application/json"
+            },
+            Body = Http:JSONEncode(payload)
+        })
+
+        if not response then
+            -- Avoid retrying an ambiguous delivery.
+            return false, "Network request failed"
+        end
+
+        local status = tonumber(response.StatusCode)
+
+        if status and status >= 200 and status < 300 then
+            return true
+        end
+
+        if status ~= 429 then
+            return false, "Discord HTTP " .. tostring(status)
+        end
+
+        local data = decode(response.Body)
+        local delay = data and tonumber(data.retry_after) or 5
+        task.wait(math.max(delay or 5, 1) + 1)
+    end
+
+    return false, "Discord remained rate-limited"
+end
+
+local function readLabels(rift)
+    local labels = {}
+
+    for _, object in ipairs(rift:GetDescendants()) do
+        if object:IsA("TextLabel") or object:IsA("TextButton") then
+            local text = clean(object.Text, 120)
+
+            if text:match("%S") then
+                table.insert(labels, {
+                    name = object.Name:lower(),
+                    path = object:GetFullName():lower(),
+                    text = text
+                })
+            end
+        end
+    end
+
+    table.sort(labels, function(a, b)
+        return a.path < b.path
+    end)
+
+    return labels
+end
+
+local function identifyLuck(labels)
+    for _, label in ipairs(labels) do
+        if label.name:find("luck", 1, true) then
+            return label.text
+        end
+    end
+
+    for _, label in ipairs(labels) do
+        if label.text:lower():find("luck", 1, true) then
+            return label.text
+        end
+    end
+
+    return "Not identified in displayed labels"
+end
+
+local function identifyTime(labels)
+    for _, label in ipairs(labels) do
+        local name = label.name
+
+        if name:find("timer", 1, true)
+            or name:find("countdown", 1, true)
+            or name:find("remaining", 1, true)
+            or name:find("expire", 1, true)
+            or name == "time"
+            or name == "duration" then
+
+            return label.text
+        end
+    end
+
+    for _, label in ipairs(labels) do
+        local text = label.text:lower()
+
+        if text:find("remaining", 1, true)
+            or text:find("expires", 1, true)
+            or text:find("disappears", 1, true)
+            or text:find("time left", 1, true) then
+
+            return label.text
+        end
+    end
+
+    for _, label in ipairs(labels) do
+        if label.text:match("^%s*%d+:%d%d%s*$")
+            or label.text:match("^%s*%d+:%d%d:%d%d%s*$") then
+
+            return label.text .. " (clock meaning unverified)"
+        end
+    end
+
+    return "Not identified in displayed labels"
+end
+
+local function buildEmbed(rift, labels, joinUrl)
+    local displayName = clean(rift.Name, 80)
+        :gsub("%-", " ")
+        :gsub("_", " ")
+
+    local embed = {
+        title = "🫧 " .. displayName .. " • Rift Spotted!",
+        url = joinUrl,
+        description =
+            "🍬 **Bubble Gum Simulator Infinity**\n"
+            .. "A loaded egg / rift entry was detected.\n\n"
+            .. "🎮 [**Join this server**](" .. joinUrl .. ")",
+
+        color = 16738740,
+
+        fields = {
+            {
+                name = "🍀 Luck",
+                value = identifyLuck(labels),
+                inline = true
+            },
+            {
+                name = "⏳ Displayed time remaining",
+                value = identifyTime(labels),
+                inline = true
+            },
+            {
+                name = "🥚 Rift / egg entry",
+                value = clean(rift.Name, 100),
+                inline = false
+            },
+            {
+                name = "🌐 Server ID",
+                value = "`" .. game.JobId .. "`",
+                inline = false
+            }
+        },
+
+        footer = {
+            text = "🍭 BGSI Rift Radar • Displayed values at scan time"
+        },
+
+        timestamp = os.date("!%Y-%m-%dT%H:%M:%SZ")
+    }
+
+    local details = {}
+    local seen = {}
+    local bytes = 0
+
+    for _, label in ipairs(labels) do
+        if not seen[label.text] then
+            seen[label.text] = true
+
+            local line = "▫️ " .. label.text
+            if bytes + #line + 1 > 850 then
+                table.insert(details, "…additional labels omitted")
+                break
+            end
+
+            bytes += #line + 1
+            table.insert(details, line)
+        end
+    end
+
+    if #details > 0 then
+        table.insert(embed.fields, {
+            name = "✨ In-game display details",
+            value = table.concat(details, "\n"),
+            inline = false
+        })
+    end
+
+    if CONFIG.GifUrl:match("^https://") then
+        embed.image = {url = CONFIG.GifUrl}
+    end
+
+    return embed
+end
+
+local function findNextServer()
+    local candidates = {}
+    local candidateIds = {}
+    local cursor
+
+    for page = 1, CONFIG.MaxServerPages do
+        local url =
+            "https://games.roblox.com/v1/games/"
+            .. tostring(game.PlaceId)
+            .. "/servers/Public?sortOrder=Asc&limit=100"
+
+        if cursor then
+            url ..= "&cursor=" .. Http:UrlEncode(cursor)
+        end
+
+        local response = requestSafely({
+            Url = url,
+            Method = "GET"
+        })
+
+        if not response or tonumber(response.StatusCode) ~= 200 then
+            return nil, "Public-server listing failed"
+        end
+
+        local data = decode(response.Body)
+        if not data or type(data.data) ~= "table" then
+            return nil, "Invalid public-server response"
+        end
+
+        for _, server in ipairs(data.data) do
+            if type(server.id) == "string"
+                and not visited[server.id]
+                and not candidateIds[server.id]
+                and type(server.playing) == "number"
+                and type(server.maxPlayers) == "number"
+                and server.playing < server.maxPlayers then
+
+                candidateIds[server.id] = true
+                table.insert(candidates, server.id)
+            end
+        end
+
+        cursor = data.nextPageCursor
+        if #candidates > 0 or not cursor then
+            break
+        end
+
+        task.wait(2)
+    end
+
+    if #candidates == 0 then
+        return nil, "No unvisited joinable server in searched pages"
+    end
+
+    return candidates[math.random(1, #candidates)]
+end
+
+local function main()
+    log("Waiting for Workspace.Rendered.Rifts...")
+
+    local rendered = workspace:WaitForChild("Rendered", 30)
+    if not rendered then
+        fail("Workspace.Rendered did not load.")
+        return
+    end
+
+    local rifts = rendered:WaitForChild("Rifts", 30)
+    if not rifts then
+        fail("Workspace.Rendered.Rifts did not load.")
+        return
+    end
+
+    task.wait(CONFIG.SettleSeconds)
+
+    local joinUrl =
+        "https://www.roblox.com/games/start?placeId="
+        .. tostring(game.PlaceId)
+        .. "&gameInstanceId="
+        .. Http:UrlEncode(game.JobId)
+
+    local riftList = {}
+
+    for _, rift in ipairs(rifts:GetChildren()) do
+        if rift:IsA("Model")
+            or rift:IsA("Folder")
+            or rift:IsA("BasePart") then
+
+            table.insert(riftList, rift)
+        end
+    end
+
+    table.sort(riftList, function(a, b)
+        return a.Name < b.Name
+    end)
+
+    log("Loaded entries: " .. #riftList)
+
+    if #riftList == 0 then
+        local sent, reason = sendDiscord({
+            embeds = {{
+                title = "🫧 BGSI • Rift Scan",
+                description =
+                    "No loaded rift entries found.\n\n"
+                    .. "🎮 [Join this server](" .. joinUrl .. ")",
+                color = 16738740,
+                timestamp = os.date("!%Y-%m-%dT%H:%M:%SZ"),
+                footer = {text = "🍭 BGSI Rift Radar"}
+            }}
+        })
+
+        if not sent then
+            fail(tostring(reason) .. ". Not hopping.")
+            return
+        end
+    end
+
+    for index, rift in ipairs(riftList) do
+        -- Skip entries that disappear before being read.
+        if rift.Parent == rifts then
+            local labels = readLabels(rift)
+            local embed = buildEmbed(rift, labels, joinUrl)
+
+            local sent, reason = sendDiscord({
+                embeds = {embed}
+            })
+
+            if not sent then
+                fail(
+                    "Report failed for " .. rift.Name
+                    .. ": " .. tostring(reason)
+                    .. ". Not hopping."
+                )
+                return
+            end
+
+            log(
+                "Sent " .. index .. "/" .. #riftList
+                .. ": " .. rift.Name
+            )
+
+            task.wait(CONFIG.MessageDelay)
+        end
+    end
+
+    log("Reports delivered. Waiting before server hop.")
+    task.wait(CONFIG.HopDelay)
+
+    local nextServer, reason = findNextServer()
+    if not nextServer then
+        fail(reason)
+        return
+    end
+
+    local nextExecution =
+        "local SOURCE = " .. string.format("%q", SOURCE) .. "\n"
+        .. "local VISITED = game:GetService('HttpService'):JSONDecode("
+        .. string.format("%q", Http:JSONEncode(visited)) .. ")\n"
+        .. SOURCE
+
+    local queued = pcall(function()
+        queueTeleport(nextExecution)
+    end)
+
+    if not queued then
+        fail("Could not queue execution in the next server.")
+        return
+    end
+
+    local failureConnection
+    failureConnection = Teleport.TeleportInitFailed:Connect(
+        function(who, result)
+            if who == player then
+                failureConnection:Disconnect()
+                fail("Teleport failed: " .. tostring(result))
+            end
+        end
+    )
+
+    log("Joining server: " .. nextServer)
+
+    local ok, err = pcall(function()
+        Teleport:TeleportToPlaceInstance(
+            game.PlaceId,
+            nextServer,
+            player
+        )
+    end)
+
+    if not ok then
+        failureConnection:Disconnect()
+        fail("Teleport request failed: " .. tostring(err))
+    end
+end
+
+local ok, err = pcall(main)
+if not ok then
+    fail("Runtime error: " .. tostring(err))
+end
+]==]
+
+if type(loadstring) ~= "function" then
+    warn("[BGSI Rift Radar] loadstring unavailable.")
+    return
+end
+
+local run, compileError = loadstring(
+    "local SOURCE = " .. string.format("%q", SOURCE)
+    .. "\n" .. SOURCE
+)
+
+if not run then
+    warn("[BGSI Rift Radar] Compile error: " .. tostring(compileError))
+    return
+end
+
+local ok, err = pcall(run)
+if not ok then
+    local environment = _G
+    if type(getgenv) == "function" then
+        environment = getgenv()
+    end
+    environment.BGSI_RIFT_RADAR_RUNNING = nil
+
+    warn("[BGSI Rift Radar] Startup error: " .. tostring(err))
+end
